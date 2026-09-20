@@ -43,7 +43,8 @@ type queries struct {
 	updateMessagePublished           string
 	selectMessagesCount              string
 	selectTopics                     string
-	markExpiredAttachmentsDeleted    string
+	selectExpiredAttachmentIDs       string
+	markAttachmentsDeleted           func(ids []string) (string, []any)
 	selectAttachmentsSizeBySender    string
 	selectAttachmentsSizeByUserID    string
 	selectAttachmentsWithSizes       string
@@ -364,16 +365,29 @@ func (c *Cache) ExpireMessages(topics ...string) error {
 	})
 }
 
-// MarkExpiredAttachmentsDeleted marks up to `limit` expired attachments as deleted in a single
-// query and returns the number of updated rows.
-func (c *Cache) MarkExpiredAttachmentsDeleted(limit int) (int64, error) {
+// ExpiredAttachmentIDs returns the IDs of up to `limit` messages whose attachments have expired
+// and have not yet been marked as deleted. The IDs are used to delete the actual blobs from
+// the attachment store before MarkAttachmentsDeleted is called.
+func (c *Cache) ExpiredAttachmentIDs(limit int) ([]string, error) {
+	rows, err := c.db.ReadOnly().Query(c.queries.selectExpiredAttachmentIDs, time.Now().Unix(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return readStrings(rows)
+}
+
+// MarkAttachmentsDeleted marks the attachments of the given messages as deleted. It is called
+// after the blobs have been removed from the attachment store.
+func (c *Cache) MarkAttachmentsDeleted(ids ...string) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	c.maybeLock()
 	defer c.maybeUnlock()
-	result, err := c.db.Exec(c.queries.markExpiredAttachmentsDeleted, time.Now().Unix(), limit)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
+	query, args := c.queries.markAttachmentsDeleted(ids)
+	_, err := c.db.Exec(query, args...)
+	return err
 }
 
 // AttachmentBytesUsedBySender returns the total size of active attachments sent by the given sender
@@ -569,8 +583,12 @@ func readMessage(rows *sql.Rows) (*model.Message, error) {
 	if err != nil {
 		senderIP = netip.Addr{} // if no IP stored in database, return invalid address
 	}
+	// Expired attachments are never returned, even if the message itself has not been pruned
+	// yet and the blob still exists on disk. This keeps poll/replay/GET responses from
+	// advertising downloadable attachments that are already (or about to be) deleted.
+	// Attachments with expires == 0 are external and never expire.
 	var att *model.Attachment
-	if attachmentName != "" && attachmentURL != "" {
+	if attachmentName != "" && attachmentURL != "" && (attachmentExpires == 0 || attachmentExpires > time.Now().Unix()) {
 		att = &model.Attachment{
 			Name:    attachmentName,
 			Type:    attachmentType,

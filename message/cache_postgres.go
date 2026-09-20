@@ -66,7 +66,8 @@ const (
 	postgresSelectTopicsQuery           = `SELECT topic FROM message GROUP BY topic`
 
 	postgresDeleteExpiredMessagesQuery         = `DELETE FROM message WHERE mid IN (SELECT mid FROM message WHERE expires <= $1 AND published = TRUE LIMIT $2)`
-	postgresMarkExpiredAttachmentsDeletedQuery = `UPDATE message SET attachment_deleted = TRUE WHERE mid IN (SELECT mid FROM message WHERE attachment_expires > 0 AND attachment_expires <= $1 AND attachment_deleted = FALSE LIMIT $2)`
+	postgresSelectExpiredAttachmentIDsQuery    = `SELECT mid FROM message WHERE attachment_expires > 0 AND attachment_expires <= $1 AND attachment_deleted = FALSE LIMIT $2`
+	postgresMarkAttachmentsDeletedQuery        = `UPDATE message SET attachment_deleted = TRUE WHERE mid = ANY($1)`
 	postgresSelectAttachmentsSizeBySenderQuery = `SELECT COALESCE(SUM(attachment_size), 0) FROM message WHERE user_id = '' AND sender = $1 AND attachment_expires >= $2`
 	postgresSelectAttachmentsSizeByUserIDQuery = `SELECT COALESCE(SUM(attachment_size), 0) FROM message WHERE user_id = $1 AND attachment_expires >= $2`
 	postgresSelectAttachmentsWithSizesQuery    = `SELECT mid, attachment_size FROM message WHERE attachment_expires > $1 AND attachment_deleted = FALSE`
@@ -92,13 +93,19 @@ var postgresQueries = queries{
 	updateMessagePublished:           postgresUpdateMessagePublishedQuery,
 	selectMessagesCount:              postgresSelectMessagesCountQuery,
 	selectTopics:                     postgresSelectTopicsQuery,
-	markExpiredAttachmentsDeleted:    postgresMarkExpiredAttachmentsDeletedQuery,
+	selectExpiredAttachmentIDs:       postgresSelectExpiredAttachmentIDsQuery,
+	markAttachmentsDeleted:           postgresMarkAttachmentsDeleted,
 	selectAttachmentsSizeBySender:    postgresSelectAttachmentsSizeBySenderQuery,
 	selectAttachmentsSizeByUserID:    postgresSelectAttachmentsSizeByUserIDQuery,
 	selectAttachmentsWithSizes:       postgresSelectAttachmentsWithSizesQuery,
 	selectStats:                      postgresSelectStatsQuery,
 	updateStats:                      postgresUpdateStatsQuery,
 	updateMessageTime:                postgresUpdateMessageTimeQuery,
+}
+
+// postgresMarkAttachmentsDeleted passes the message IDs as a single array parameter
+func postgresMarkAttachmentsDeleted(ids []string) (string, []any) {
+	return postgresMarkAttachmentsDeletedQuery, []any{ids}
 }
 
 // NewPostgresStore creates a new PostgreSQL-backed message cache store using an existing database connection pool.

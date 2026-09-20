@@ -765,11 +765,6 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request, v *visitor) 
 		})
 	}
 	defer reader.Close()
-	w.Header().Set("Access-Control-Allow-Origin", s.config.AccessControlAllowOrigin) // CORS, allow cross-origin requests
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-	if r.Method == http.MethodHead {
-		return nil
-	}
 	// Find message in database, and associate bandwidth to the uploader user
 	// This is an easy way to
 	//   - avoid abuse (e.g. 1 uploader, 1k downloaders)
@@ -791,6 +786,20 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request, v *visitor) 
 		}
 	} else if err != nil {
 		return err
+	}
+	// The cache strips expired attachments when reading, so a nil attachment here means the
+	// attachment has expired (or the message never had one). Do not serve the blob, even if
+	// it still exists on disk awaiting cleanup.
+	if m.Attachment == nil {
+		return errHTTPNotFound.Fields(log.Context{
+			"message_id":    messageID,
+			"error_context": "attachment_expired",
+		})
+	}
+	w.Header().Set("Access-Control-Allow-Origin", s.config.AccessControlAllowOrigin) // CORS, allow cross-origin requests
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+	if r.Method == http.MethodHead {
+		return nil
 	}
 	bandwidthVisitor := v
 	if s.userManager != nil && m.User != "" {

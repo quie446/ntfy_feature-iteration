@@ -2607,7 +2607,7 @@ func TestServer_PublishAttachmentAndExpire(t *testing.T) {
 		content := util.RandomString(5000) // > 4096
 
 		c := newTestConfig(t, databaseURL)
-		c.AttachmentExpiryDuration = time.Millisecond // Hack
+		c.AttachmentExpiryDuration = 2 * time.Second // Shortest useful expiry (second granularity)
 		s := newTestServer(t, c)
 
 		// Publish and make sure we can retrieve it
@@ -2622,16 +2622,116 @@ func TestServer_PublishAttachmentAndExpire(t *testing.T) {
 		require.Equal(t, 200, response.Code)
 		require.Equal(t, content, response.Body.String())
 
-		// Prune and makes sure it's gone. We backdate the file so sync's grace
-		// period doesn't protect it, then run the manager + sync explicitly.
-		require.Nil(t, os.Chtimes(file, time.Now().Add(-2*time.Hour), time.Now().Add(-2*time.Hour)))
+		// Wait for the attachment to expire. Even before the manager prunes anything,
+		// the download must be blocked and poll must not return the attachment anymore.
 		waitFor(t, func() bool {
-			s.execManager()
-			s.attachment.Sync() // File cleanup is done by sync, not by the manager
-			return !util.FileExists(file)
+			return time.Now().Unix() > msg.Attachment.Expires
 		})
 		response = request(t, s, "GET", path, "", nil)
 		require.Equal(t, 404, response.Code)
+
+		response = request(t, s, "HEAD", path, "", nil)
+		require.Equal(t, 404, response.Code)
+
+		response = request(t, s, "GET", "/mytopic/json?poll=1", "", nil)
+		require.Equal(t, 200, response.Code)
+		messages := toMessages(t, response.Body.String())
+		require.Equal(t, 1, len(messages))
+		require.Nil(t, messages[0].Attachment, "expired attachment must not be returned by poll")
+
+		// The manager deletes the blob itself (no store sync or file backdating required)
+		s.execManager()
+		require.False(t, util.FileExists(file))
+	})
+}
+
+func TestServer_PublishAttachmentExpiryConcurrentPublish(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, databaseURL string) {
+		t.Parallel()
+
+		c := newTestConfig(t, databaseURL)
+		c.AttachmentExpiryDuration = time.Second // Old attachment expires almost immediately
+		s := newTestServer(t, c)
+
+		// Publish a message with an attachment that expires right away
+		response := request(t, s, "PUT", "/mytopic", util.RandomString(5000), nil)
+		require.Equal(t, 200, response.Code)
+		oldMsg := toMessage(t, response.Body.String())
+		oldFile := filepath.Join(s.config.AttachmentCacheDir, oldMsg.ID)
+		require.FileExists(t, oldFile)
+
+		// From now on, new attachments live for hours
+		c.AttachmentExpiryDuration = 3 * time.Hour
+
+		// Wait for the exact expiry boundary, then hammer the topic with new attachments
+		// while the manager prunes expired attachments concurrently
+		waitFor(t, func() bool {
+			return time.Now().Unix() > oldMsg.Attachment.Expires
+		})
+		const publishers = 8
+		bodies := make([]string, publishers)
+		codes := make([]int, publishers)
+		pruneDone := make(chan bool)
+		var pruneWg sync.WaitGroup
+		pruneWg.Add(1)
+		go func() {
+			defer pruneWg.Done()
+			for {
+				select {
+				case <-pruneDone:
+					return
+				default:
+					s.execManager()
+				}
+			}
+		}()
+		var wg sync.WaitGroup
+		for i := 0; i < publishers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				response := request(t, s, "PUT", "/mytopic", util.RandomString(5000), nil)
+				codes[i] = response.Code
+				bodies[i] = response.Body.String()
+			}(i)
+		}
+		wg.Wait()
+		close(pruneDone)
+		pruneWg.Wait()
+		s.execManager() // One final pass after all publishes settled
+
+		// The expired attachment blob is gone ...
+		require.False(t, util.FileExists(oldFile))
+
+		// ... but every concurrently published attachment survived the pruning
+		newIDs := make([]string, publishers)
+		for i := 0; i < publishers; i++ {
+			require.Equal(t, 200, codes[i])
+			newMsg := toMessage(t, bodies[i])
+			newIDs[i] = newMsg.ID
+			require.FileExists(t, filepath.Join(s.config.AttachmentCacheDir, newMsg.ID))
+		}
+
+		// The old attachment is no longer downloadable ...
+		oldPath := strings.TrimPrefix(oldMsg.Attachment.URL, "http://127.0.0.1:12345")
+		response = request(t, s, "GET", oldPath, "", nil)
+		require.Equal(t, 404, response.Code)
+
+		// ... and poll does not resurrect it, while all new attachments are intact
+		response = request(t, s, "GET", "/mytopic/json?poll=1", "", nil)
+		require.Equal(t, 200, response.Code)
+		messages := toMessages(t, response.Body.String())
+		require.Equal(t, publishers+1, len(messages))
+		for _, m := range messages {
+			if m.ID == oldMsg.ID {
+				require.Nil(t, m.Attachment, "expired attachment must not be resurrected by poll")
+				continue
+			}
+			require.NotNil(t, m.Attachment)
+			path := strings.TrimPrefix(m.Attachment.URL, "http://127.0.0.1:12345")
+			response = request(t, s, "GET", path, "", nil)
+			require.Equal(t, 200, response.Code)
+		}
 	})
 }
 

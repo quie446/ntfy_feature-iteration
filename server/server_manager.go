@@ -143,22 +143,34 @@ func (s *Server) pruneAttachments() {
 	if s.attachment == nil {
 		return
 	}
-	// Only mark as deleted in DB. The actual storage files are cleaned up
-	// by the attachment store's sync() loop, which periodically reconciles
-	// storage with the database and removes orphaned files.
+	// Delete the blobs for expired attachments in the same manager pass that prunes
+	// messages, then mark them as deleted in the cache. Deletion is keyed by message ID
+	// (selected from the database only after the attachment has expired), so blobs of
+	// newly published messages are never touched, even if they race with this run.
+	// The attachment store's sync() loop remains as a safety net for true orphans
+	// (e.g. a crash between blob write and cache commit).
 	log.
 		Tag(tagManager).
 		Timing(func() {
-			count, err := s.messageCache.MarkExpiredAttachmentsDeleted(s.config.ManagerBatchSize)
+			ids, err := s.messageCache.ExpiredAttachmentIDs(s.config.ManagerBatchSize)
 			if err != nil {
-				log.Tag(tagManager).Err(err).Warn("Error marking expired attachments as deleted")
-			} else if count > 0 {
-				log.Tag(tagManager).Debug("Marked %d expired attachment(s) as deleted", count)
-			} else {
-				log.Tag(tagManager).Debug("No expired attachments to delete")
+				log.Tag(tagManager).Err(err).Warn("Error retrieving expired attachments")
+				return
 			}
+			if len(ids) == 0 {
+				log.Tag(tagManager).Debug("No expired attachments to delete")
+				return
+			}
+			if err := s.attachment.Remove(ids...); err != nil {
+				log.Tag(tagManager).Err(err).Warn("Error deleting expired attachment files")
+				return // Retry next run; only mark as deleted after the blobs are gone
+			}
+			if err := s.messageCache.MarkAttachmentsDeleted(ids...); err != nil {
+				log.Tag(tagManager).Err(err).Warn("Error marking expired attachments as deleted")
+			}
+			log.Tag(tagManager).Debug("Deleted %d expired attachment(s)", len(ids))
 		}).
-		Debug("Finished marking expired attachments as deleted")
+		Debug("Finished deleting expired attachments")
 }
 
 func (s *Server) pruneMessages() {

@@ -1,6 +1,7 @@
 package message_test
 
 import (
+	"fmt"
 	"net/netip"
 	"path/filepath"
 	"sync"
@@ -290,7 +291,7 @@ func TestStore_Prune(t *testing.T) {
 
 func TestStore_Attachments(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, s *message.Cache) {
-		expires1 := time.Now().Add(-4 * time.Hour).Unix() // Expired
+		expires1 := time.Now().Add(4 * time.Hour).Unix() // Future (expired attachments are stripped on read, see TestStore_Messages_ExpiredAttachmentStrippedOnRead)
 		m := model.NewDefaultMessage("mytopic", "flower for you")
 		m.ID = "m1"
 		m.SequenceID = "m1"
@@ -355,7 +356,7 @@ func TestStore_Attachments(t *testing.T) {
 
 		size, err := s.AttachmentBytesUsedBySender("1.2.3.4")
 		require.Nil(t, err)
-		require.Equal(t, int64(10000), size)
+		require.Equal(t, int64(15000), size) // Both m1 (5000) and m2 (10000) are unexpired and counted
 
 		size, err = s.AttachmentBytesUsedBySender("5.6.7.8")
 		require.Nil(t, err)
@@ -413,9 +414,156 @@ func TestStore_AttachmentsExpired(t *testing.T) {
 		}
 		require.Nil(t, s.AddMessage(m))
 
-		count, err := s.MarkExpiredAttachmentsDeleted(10)
+		ids, err := s.ExpiredAttachmentIDs(10)
 		require.Nil(t, err)
-		require.Equal(t, int64(1), count)
+		require.Equal(t, []string{"m4"}, ids)
+
+		require.Nil(t, s.MarkAttachmentsDeleted(ids...))
+
+		// No more expired attachments after marking them as deleted
+		ids, err = s.ExpiredAttachmentIDs(10)
+		require.Nil(t, err)
+		require.Empty(t, ids)
+	})
+}
+
+func TestStore_ExpiredAttachmentIDs_Boundary(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, s *message.Cache) {
+		now := time.Now().Unix()
+		addWithAttachmentExpiry := func(id string, attachmentExpires int64) {
+			m := model.NewDefaultMessage("mytopic", "message "+id)
+			m.ID = id
+			m.SequenceID = id
+			m.Expires = now + 86400
+			m.Attachment = &model.Attachment{
+				Name:    id + ".txt",
+				Type:    "text/plain",
+				Size:    1000,
+				Expires: attachmentExpires,
+				URL:     "https://ntfy.sh/file/" + id,
+			}
+			require.Nil(t, s.AddMessage(m))
+		}
+		addWithAttachmentExpiry("expired-exactly-now", now)      // Boundary: expires == now is expired
+		addWithAttachmentExpiry("expired-one-second-ago", now-1) // Expired
+		addWithAttachmentExpiry("not-yet-expired", now+1)        // Boundary: expires == now+1 is still valid
+		addWithAttachmentExpiry("external-no-expiry", 0)         // External attachments never expire
+
+		ids, err := s.ExpiredAttachmentIDs(10)
+		require.Nil(t, err)
+		require.ElementsMatch(t, []string{"expired-exactly-now", "expired-one-second-ago"}, ids)
+
+		// The limit caps how many IDs are returned per batch
+		ids, err = s.ExpiredAttachmentIDs(1)
+		require.Nil(t, err)
+		require.Equal(t, 1, len(ids))
+	})
+}
+
+func TestStore_ExpiredAttachmentIDs_ConcurrentPublish(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, s *message.Cache) {
+		// Seed one message with an already expired attachment
+		expired := model.NewDefaultMessage("mytopic", "expired attachment")
+		expired.ID = "expired-msg"
+		expired.SequenceID = "expired-msg"
+		expired.Expires = time.Now().Add(time.Hour).Unix()
+		expired.Attachment = &model.Attachment{
+			Name:    "old.txt",
+			Size:    1000,
+			Expires: time.Now().Add(-time.Minute).Unix(),
+			URL:     "https://ntfy.sh/file/old.txt",
+		}
+		require.Nil(t, s.AddMessage(expired))
+
+		// Concurrently publish messages with valid attachments while expiring old ones.
+		// The cleanup must never return (or mark) any of the new messages' IDs.
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				for j := 0; j < 10; j++ {
+					id := fmt.Sprintf("new-msg-%d-%d", i, j)
+					m := model.NewDefaultMessage("mytopic", "new attachment")
+					m.ID = id
+					m.SequenceID = id
+					m.Expires = time.Now().Add(time.Hour).Unix()
+					m.Attachment = &model.Attachment{
+						Name:    id + ".txt",
+						Size:    1000,
+						Expires: time.Now().Add(time.Hour).Unix(),
+						URL:     "https://ntfy.sh/file/" + id,
+					}
+					if err := s.AddMessage(m); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			}(i)
+		}
+		for {
+			ids, err := s.ExpiredAttachmentIDs(10)
+			require.Nil(t, err)
+			for _, id := range ids {
+				require.Equal(t, "expired-msg", id, "cleanup must never select a live attachment")
+			}
+			if len(ids) == 0 {
+				break
+			}
+			require.Nil(t, s.MarkAttachmentsDeleted(ids...))
+		}
+		wg.Wait()
+
+		// All new messages are still fully intact, attachments included
+		messages, err := s.Messages("mytopic", model.SinceAllMessages, false)
+		require.Nil(t, err)
+		require.Equal(t, 81, len(messages))
+		for _, m := range messages {
+			if m.ID == "expired-msg" {
+				require.Nil(t, m.Attachment) // Expired attachments are stripped on read
+			} else {
+				require.NotNil(t, m.Attachment)
+			}
+		}
+	})
+}
+
+func TestStore_Messages_ExpiredAttachmentStrippedOnRead(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, s *message.Cache) {
+		now := time.Now().Unix()
+		addWithAttachmentExpiry := func(id string, attachmentExpires int64) {
+			m := model.NewDefaultMessage("mytopic", "message "+id)
+			m.ID = id
+			m.SequenceID = id
+			m.Expires = now + 86400 // Message itself is not expired
+			m.Attachment = &model.Attachment{
+				Name:    id + ".txt",
+				Type:    "text/plain",
+				Size:    1000,
+				Expires: attachmentExpires,
+				URL:     "https://ntfy.sh/file/" + id,
+			}
+			require.Nil(t, s.AddMessage(m))
+		}
+		addWithAttachmentExpiry("m-expired", now-1)
+		addWithAttachmentExpiry("m-valid", now+3600)
+		addWithAttachmentExpiry("m-external", 0)
+
+		messages, err := s.Messages("mytopic", model.SinceAllMessages, false)
+		require.Nil(t, err)
+		require.Equal(t, 3, len(messages))
+		require.Nil(t, messages[0].Attachment, "expired attachment must not be returned")
+		require.NotNil(t, messages[1].Attachment)
+		require.Equal(t, "https://ntfy.sh/file/m-valid", messages[1].Attachment.URL)
+		require.NotNil(t, messages[2].Attachment, "external attachments never expire")
+
+		// Same for direct message lookups
+		m, err := s.Message("m-expired")
+		require.Nil(t, err)
+		require.Nil(t, m.Attachment)
+		m, err = s.Message("m-valid")
+		require.Nil(t, err)
+		require.NotNil(t, m.Attachment)
 	})
 }
 
@@ -623,15 +771,16 @@ func TestStore_MarkAttachmentsDeleted(t *testing.T) {
 		}
 		require.Nil(t, s.AddMessage(m2))
 
-		// Both should be marked as deleted in one batch
-		count, err := s.MarkExpiredAttachmentsDeleted(10)
+		// Both should be returned as expired and marked as deleted in one batch
+		ids, err := s.ExpiredAttachmentIDs(10)
 		require.Nil(t, err)
-		require.Equal(t, int64(2), count)
+		require.ElementsMatch(t, []string{"msg1", "msg2"}, ids)
+		require.Nil(t, s.MarkAttachmentsDeleted(ids...))
 
 		// No more expired attachments to clean up
-		count, err = s.MarkExpiredAttachmentsDeleted(10)
+		ids, err = s.ExpiredAttachmentIDs(10)
 		require.Nil(t, err)
-		require.Equal(t, int64(0), count)
+		require.Empty(t, ids)
 
 		// Messages themselves still exist
 		messages, err := s.Messages("mytopic", model.SinceAllMessages, false)

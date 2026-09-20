@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -68,11 +69,12 @@ const (
 	sqliteSelectMessagesCountQuery    = `SELECT COUNT(*) FROM messages`
 	sqliteSelectTopicsQuery           = `SELECT topic FROM messages GROUP BY topic`
 
-	sqliteDeleteExpiredMessagesQuery         = `DELETE FROM messages WHERE mid IN (SELECT mid FROM messages WHERE expires <= ? AND published = 1 LIMIT ?)`
-	sqliteMarkExpiredAttachmentsDeletedQuery = `UPDATE messages SET attachment_deleted = 1 WHERE mid IN (SELECT mid FROM messages WHERE attachment_expires > 0 AND attachment_expires <= ? AND attachment_deleted = 0 LIMIT ?)`
-	sqliteSelectAttachmentsSizeBySenderQuery = `SELECT IFNULL(SUM(attachment_size), 0) FROM messages WHERE user = '' AND sender = ? AND attachment_expires >= ?`
-	sqliteSelectAttachmentsSizeByUserIDQuery = `SELECT IFNULL(SUM(attachment_size), 0) FROM messages WHERE user = ? AND attachment_expires >= ?`
-	sqliteSelectAttachmentsWithSizesQuery    = `SELECT mid, attachment_size FROM messages WHERE attachment_expires > ? AND attachment_deleted = 0`
+	sqliteDeleteExpiredMessagesQuery          = `DELETE FROM messages WHERE mid IN (SELECT mid FROM messages WHERE expires <= ? AND published = 1 LIMIT ?)`
+	sqliteSelectExpiredAttachmentIDsQuery     = `SELECT mid FROM messages WHERE attachment_expires > 0 AND attachment_expires <= ? AND attachment_deleted = 0 LIMIT ?`
+	sqliteMarkAttachmentsDeletedQueryTemplate = `UPDATE messages SET attachment_deleted = 1 WHERE mid IN (%s)`
+	sqliteSelectAttachmentsSizeBySenderQuery  = `SELECT IFNULL(SUM(attachment_size), 0) FROM messages WHERE user = '' AND sender = ? AND attachment_expires >= ?`
+	sqliteSelectAttachmentsSizeByUserIDQuery  = `SELECT IFNULL(SUM(attachment_size), 0) FROM messages WHERE user = ? AND attachment_expires >= ?`
+	sqliteSelectAttachmentsWithSizesQuery     = `SELECT mid, attachment_size FROM messages WHERE attachment_expires > ? AND attachment_deleted = 0`
 
 	sqliteSelectStatsQuery       = `SELECT value FROM stats WHERE key = 'messages'`
 	sqliteUpdateStatsQuery       = `UPDATE stats SET value = ? WHERE key = 'messages'`
@@ -95,13 +97,24 @@ var sqliteQueries = queries{
 	updateMessagePublished:           sqliteUpdateMessagePublishedQuery,
 	selectMessagesCount:              sqliteSelectMessagesCountQuery,
 	selectTopics:                     sqliteSelectTopicsQuery,
-	markExpiredAttachmentsDeleted:    sqliteMarkExpiredAttachmentsDeletedQuery,
+	selectExpiredAttachmentIDs:       sqliteSelectExpiredAttachmentIDsQuery,
+	markAttachmentsDeleted:           sqliteMarkAttachmentsDeleted,
 	selectAttachmentsSizeBySender:    sqliteSelectAttachmentsSizeBySenderQuery,
 	selectAttachmentsSizeByUserID:    sqliteSelectAttachmentsSizeByUserIDQuery,
 	selectAttachmentsWithSizes:       sqliteSelectAttachmentsWithSizesQuery,
 	selectStats:                      sqliteSelectStatsQuery,
 	updateStats:                      sqliteUpdateStatsQuery,
 	updateMessageTime:                sqliteUpdateMessageTimeQuery,
+}
+
+// sqliteMarkAttachmentsDeleted builds an UPDATE query with one placeholder per message ID
+func sqliteMarkAttachmentsDeleted(ids []string) (string, []any) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return fmt.Sprintf(sqliteMarkAttachmentsDeletedQueryTemplate, placeholders), args
 }
 
 // NewSQLiteStore creates a SQLite file-backed cache
