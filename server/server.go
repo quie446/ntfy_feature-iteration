@@ -757,20 +757,9 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request, v *visitor) 
 		return errHTTPInternalErrorInvalidPath
 	}
 	messageID := matches[1]
-	reader, size, err := s.attachment.Read(messageID)
-	if err != nil {
-		return errHTTPNotFound.Fields(log.Context{
-			"message_id":    messageID,
-			"error_context": "attachment_store",
-		})
-	}
-	defer reader.Close()
-	w.Header().Set("Access-Control-Allow-Origin", s.config.AccessControlAllowOrigin) // CORS, allow cross-origin requests
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-	if r.Method == http.MethodHead {
-		return nil
-	}
-	// Find message in database, and associate bandwidth to the uploader user
+	// Find message in database first: it decides whether the attachment may be served
+	// at all (expired or deleted attachments must not be downloadable, even if the file
+	// still exists), and it associates the download bandwidth with the uploader.
 	// This is an easy way to
 	//   - avoid abuse (e.g. 1 uploader, 1k downloaders)
 	//   - and also uses the higher bandwidth limits of a paying user
@@ -791,6 +780,27 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request, v *visitor) 
 		}
 	} else if err != nil {
 		return err
+	}
+	if m.Attachment == nil {
+		// The message has no live attachment: it never had one, or it expired/was deleted
+		// (stripped when read from the cache). Never serve a file for it.
+		return errHTTPNotFound.Fields(log.Context{
+			"message_id":    messageID,
+			"error_context": "attachment_expired_or_deleted",
+		})
+	}
+	reader, size, err := s.attachment.Read(messageID)
+	if err != nil {
+		return errHTTPNotFound.Fields(log.Context{
+			"message_id":    messageID,
+			"error_context": "attachment_store",
+		})
+	}
+	defer reader.Close()
+	w.Header().Set("Access-Control-Allow-Origin", s.config.AccessControlAllowOrigin) // CORS, allow cross-origin requests
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+	if r.Method == http.MethodHead {
+		return nil
 	}
 	bandwidthVisitor := v
 	if s.userManager != nil && m.User != "" {

@@ -259,16 +259,33 @@ func (c *Cache) MessagesDue() ([]*model.Message, error) {
 	return readMessages(rows)
 }
 
-// DeleteExpiredMessages deletes up to `limit` expired messages in a single query
-// and returns the number of deleted rows.
-func (c *Cache) DeleteExpiredMessages(limit int) (int64, error) {
+// DeleteExpiredMessages deletes up to `limit` expired messages in a single query and returns
+// the IDs of the deleted messages that had a locally stored attachment (attachment_expires > 0).
+// The caller must remove those files from the attachment store, so that blobs take the same
+// cleanup path as their messages instead of lingering until the next store sync.
+func (c *Cache) DeleteExpiredMessages(limit int) ([]string, error) {
 	c.maybeLock()
 	defer c.maybeUnlock()
-	result, err := c.db.Exec(c.queries.deleteExpiredMessages, time.Now().Unix(), limit)
+	rows, err := c.db.Query(c.queries.deleteExpiredMessages, time.Now().Unix(), limit)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected()
+	defer rows.Close()
+	attachmentIDs := make([]string, 0)
+	for rows.Next() {
+		var id string
+		var attachmentExpires int64
+		if err := rows.Scan(&id, &attachmentExpires); err != nil {
+			return nil, err
+		}
+		if attachmentExpires > 0 {
+			attachmentIDs = append(attachmentIDs, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return attachmentIDs, nil
 }
 
 // Message returns the message with the given ID, or ErrMessageNotFound if not found
@@ -365,15 +382,17 @@ func (c *Cache) ExpireMessages(topics ...string) error {
 }
 
 // MarkExpiredAttachmentsDeleted marks up to `limit` expired attachments as deleted in a single
-// query and returns the number of updated rows.
-func (c *Cache) MarkExpiredAttachmentsDeleted(limit int) (int64, error) {
+// query and returns the IDs of the affected messages. The caller must remove those files from
+// the attachment store. Deletion is by exact message ID, so attachments of concurrently
+// published messages (which have unique IDs) are never touched.
+func (c *Cache) MarkExpiredAttachmentsDeleted(limit int) ([]string, error) {
 	c.maybeLock()
 	defer c.maybeUnlock()
-	result, err := c.db.Exec(c.queries.markExpiredAttachmentsDeleted, time.Now().Unix(), limit)
+	rows, err := c.db.Query(c.queries.markExpiredAttachmentsDeleted, time.Now().Unix(), limit)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return result.RowsAffected()
+	return readStrings(rows)
 }
 
 // AttachmentBytesUsedBySender returns the total size of active attachments sent by the given sender
@@ -569,8 +588,14 @@ func readMessage(rows *sql.Rows) (*model.Message, error) {
 	if err != nil {
 		senderIP = netip.Addr{} // if no IP stored in database, return invalid address
 	}
+	// Never hand out attachments of expired messages, or expired/deleted attachments:
+	// their blobs may already be gone from the attachment store, so a URL would be a
+	// dangling pointer. An attachment_deleted row always has attachment_expires in the
+	// past, so checking the expiry timestamps covers both.
+	messageExpired := expires > 0 && expires <= time.Now().Unix()
+	attachmentExpired := attachmentExpires > 0 && attachmentExpires <= time.Now().Unix()
 	var att *model.Attachment
-	if attachmentName != "" && attachmentURL != "" {
+	if attachmentName != "" && attachmentURL != "" && !messageExpired && !attachmentExpired {
 		att = &model.Attachment{
 			Name:    attachmentName,
 			Type:    attachmentType,

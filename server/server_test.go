@@ -2607,7 +2607,7 @@ func TestServer_PublishAttachmentAndExpire(t *testing.T) {
 		content := util.RandomString(5000) // > 4096
 
 		c := newTestConfig(t, databaseURL)
-		c.AttachmentExpiryDuration = time.Millisecond // Hack
+		c.AttachmentExpiryDuration = time.Second // Hack: expires almost immediately
 		s := newTestServer(t, c)
 
 		// Publish and make sure we can retrieve it
@@ -2622,16 +2622,87 @@ func TestServer_PublishAttachmentAndExpire(t *testing.T) {
 		require.Equal(t, 200, response.Code)
 		require.Equal(t, content, response.Body.String())
 
-		// Prune and makes sure it's gone. We backdate the file so sync's grace
-		// period doesn't protect it, then run the manager + sync explicitly.
-		require.Nil(t, os.Chtimes(file, time.Now().Add(-2*time.Hour), time.Now().Add(-2*time.Hour)))
+		// Prune and make sure it's gone. The manager pass itself deletes the file once
+		// the attachment expires (~1s); no backdating or store sync is needed.
 		waitFor(t, func() bool {
 			s.execManager()
-			s.attachment.Sync() // File cleanup is done by sync, not by the manager
 			return !util.FileExists(file)
 		})
 		response = request(t, s, "GET", path, "", nil)
 		require.Equal(t, 404, response.Code)
+
+		// The expired message no longer hands out a downloadable attachment either
+		response = request(t, s, "GET", "/mytopic/json?poll=1&since=all", "", nil)
+		require.Equal(t, 200, response.Code)
+		require.NotContains(t, response.Body.String(), "\"attachment\"")
+	})
+}
+
+func TestServer_PublishAttachmentExpireAndConcurrentPublish(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, databaseURL string) {
+		t.Parallel()
+
+		c := newTestConfig(t, databaseURL)
+		c.AttachmentExpiryDuration = 1500 * time.Millisecond // Short, but generous enough for slow CI
+		s := newTestServer(t, c)
+
+		// Publish a message whose attachment is about to expire
+		oldContent := util.RandomString(5000) // > 4096, so it's treated as an attachment
+		response := request(t, s, "PUT", "/oldtopic", oldContent, nil)
+		require.Equal(t, 200, response.Code)
+		oldMsg := toMessage(t, response.Body.String())
+		oldFile := filepath.Join(s.config.AttachmentCacheDir, oldMsg.ID)
+		require.FileExists(t, oldFile)
+
+		// Wait for the old attachment to expire
+		time.Sleep(1600 * time.Millisecond)
+
+		// Concurrently hammer the same topic with new attachments while the manager
+		// prunes. The cleanup works on exact message IDs, so it must never delete
+		// the new files.
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				s.execManager()
+				select {
+				case <-stop:
+					return
+				default:
+				}
+			}
+		}()
+		newMessages := make([]*model.Message, 0)
+		for i := 0; i < 10; i++ {
+			response := request(t, s, "PUT", "/oldtopic", util.RandomString(5000), nil)
+			require.Equal(t, 200, response.Code)
+			newMessages = append(newMessages, toMessage(t, response.Body.String()))
+		}
+		close(stop)
+		wg.Wait()
+		s.execManager() // One final pass, after all publishes
+
+		// Old attachment file is gone, and the expired message no longer serves it
+		require.NoFileExists(t, oldFile)
+		oldPath := strings.TrimPrefix(oldMsg.Attachment.URL, "http://127.0.0.1:12345")
+		response = request(t, s, "GET", oldPath, "", nil)
+		require.Equal(t, 404, response.Code)
+
+		// Every new attachment that has not expired yet (checked against its own
+		// expiry, to stay robust on slow machines) must still be there and served
+		live := 0
+		for _, m := range newMessages {
+			if m.Attachment.Expires <= time.Now().Unix() {
+				continue // Legitimately expired by now; the manager may have removed it
+			}
+			live++
+			require.FileExists(t, filepath.Join(s.config.AttachmentCacheDir, m.ID))
+			response = request(t, s, "GET", "/file/"+m.ID, "", nil)
+			require.Equal(t, 200, response.Code)
+		}
+		require.Greater(t, live, 0)
 	})
 }
 
